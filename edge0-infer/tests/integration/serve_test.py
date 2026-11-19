@@ -142,7 +142,7 @@ def main():
     description = json.loads(subprocess.run([args.cli, 'describe', '--model', str(model), '--device', args.backend],
                                            check=True, capture_output=True, text=True).stdout)
     capabilities = {'thinking': description['thinking']['enabled_supported'],
-                    'thinking_default': description['thinking']['default']}
+                    'thinking_default': description['thinking']['default'], 'vision': False}
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         if args.case in ('all', 'messages'):

@@ -3,6 +3,7 @@
 #include "tools/cli/serve_delegate.h"
 #include "tools/cli/serve_delegate_status.h"
 #include "tests/support/check.h"
+#include <algorithm>
 #include <fstream>
 #include <cstdlib>
 #include <limits>
@@ -33,7 +34,7 @@ const char* placeholder = R"({"model_name":"edge0-145b-q3k","exe":"ignored","arg
 void complete(const fs::path& model) {
     write(model / "model.json", placeholder);
     for (const auto* name : {"latent_dense_q8.bin", "latent_dense_q4.bin",
-                             "model-skeleton.gguf", "ple-fp8.gguf", "profile.bin"})
+                             "model-skeleton.gguf", "ple-fp8.gguf", "profile.bin", "mmproj-BF16.gguf"})
         write(model / name, name);
     for (const auto* name : {"experts.bin", "labels.bin", "dense.bin", "index.txt", "native_experts.txt"})
         write(model / name, name);
@@ -148,8 +149,9 @@ int main() {
     for (const auto* bad : {"cpu", "metal", "vulkan", "cuda:", "cuda:x", "cuda:-1", "CUDA", "cuda:1 "})
         CHECK(throws_config([&] { parse_device(bad); }, "CUDA GPU"));
     const auto defaults = resolve_options(registration, {});
-    CHECK((defaults == std::map<std::string, std::string>{{"du", "q8"}, {"ple-io", "direct"}}));
-    CHECK((resolve_options(registration, {{"du", "q4"}, {"ple-io", "ram"}}) == std::map<std::string, std::string>{{"du", "q4"}, {"ple-io", "ram"}}));
+    CHECK((defaults == std::map<std::string, std::string>{{"du", "q8"}, {"ple-io", "direct"}, {"vision", "off"}}));
+    CHECK((resolve_options(registration, {{"du", "q4"}, {"ple-io", "ram"}}) ==
+           std::map<std::string, std::string>{{"du", "q4"}, {"ple-io", "ram"}, {"vision", "off"}}));
     CHECK(throws_config([&] { resolve_options(registration, {{"du", "q5"}}); }, "q8|q4"));
     CHECK(throws_config([&] { resolve_options(registration, {{"ple-io", "mmap"}}); }, "direct|ram"));
     CHECK(throws_config([&] { resolve_options(registration, {{"experts", "resident"}}); }, "unknown model option experts"));
@@ -273,6 +275,112 @@ int main() {
             expand_template(Json::parse(R"({"exe":"x","args":[],"prepare":[{"output":"","script":"t.py","args":[]}]})"),
                             registration, options, Platform::posix, &steps);
         }, "needs output, script and args"));
+    }
+
+    // Pictures: --model-option vision=off|cpu|gpu. off is the default and leaves the engine text only.
+    {
+        CHECK(resolve_options(registration, {}).at("vision") == "off");
+        CHECK(resolve_options(registry().at(1), {}).at("vision") == "off");
+        CHECK(vision_choice({}) == "off" && vision_choice({{"du", "q4"}}) == "off");
+        CHECK(vision_choice(resolve_options(registration, {{"vision", "gpu"}})) == "gpu");
+        CHECK(throws_config([&] { resolve_options(registration, {{"vision", "on"}}); }, "must be off|cpu|gpu (got on)"));
+        // The vision projector is required only when pictures are asked for; the hint is the choice that needs nothing more.
+        complete(model);
+        fs::remove(model / "mmproj-BF16.gguf");
+        auto pictures = detect(model);
+        CHECK(pictures->complete() && pictures->complete({{"vision", "off"}}));
+        CHECK(!pictures->complete({{"vision", "cpu"}}) && !pictures->complete({{"vision", "gpu"}}));
+        for (const auto* choice : {"cpu", "gpu"}) {
+            const auto chosen = resolve_options(registration, {{"vision", choice}});
+            CHECK((pictures->missing(chosen) == std::vector<std::string>{"mmproj-BF16.gguf"}));
+            CHECK((pictures->alternatives(chosen) == std::vector<std::string>{"vision=off"}));
+        }
+        // A value list keeps the D/U hints as they were: only the option whose files are missing is offered.
+        fs::remove(model / "latent_dense_q8.bin");
+        pictures = detect(model);
+        CHECK((pictures->alternatives(resolve_options(registration, {{"vision", "cpu"}})) == std::vector<std::string>{"du=q4", "vision=off"}));
+        write(model / "latent_dense_q8.bin", "latent_dense_q8.bin");
+        write(model / "mmproj-BF16.gguf", "projector");
+        pictures = detect(model);
+        CHECK(pictures->complete({{"vision", "cpu"}}) && pictures->complete({{"vision", "gpu"}}));
+        for (const auto& file : inspect_json(*pictures, model)["files"])
+            if (file["filename"] == "mmproj-BF16.gguf") CHECK(file["required"] == "vision=cpu|gpu" && file["exists"] == true);
+        const auto ask = [&](const char* choice) {
+            const auto chosen = resolve_options(registration, {{"vision", choice}});
+            return inspect_report(*pictures, model, {{"vision", choice}}, "cuda:0").code == 0 && chosen.at("vision") == choice;
+        };
+        CHECK(ask("off") && ask("cpu") && ask("gpu"));
+
+        // Expansion: the template's "vision_option" entry never reaches the config; for cpu/gpu it becomes "vision",
+        // with "gpu" and --vision, and for off nothing is left of it.
+        const auto with_vision = Json::parse(R"({"exe":"${STRATA_DIR}/build/strata${EXE_SUFFIX}","args":["--pack","${MODEL_DIR}"],
+            "vision_option":{"exe":"${STRATA_DIR}/build-vision/bin/strata-vision${EXE_SUFFIX}","mmproj":"${MODEL_DIR}/mmproj-BF16.gguf",
+                      "model":"${MODEL_DIR}/model-skeleton.gguf"}})");
+        LaunchOptions launch;
+        launch.strata_dir = "/opt/edge0-strata";
+        launch.model = "/models/edge0-145b";
+        launch.experts = "q3k";
+        launch.model_options = resolve_options(registration, {});
+        auto expanded = expand_template(with_vision, registration, launch, Platform::posix);
+        CHECK(!expanded.contains("vision") && !expanded.contains("vision_option"));
+        CHECK((expanded["args"] == Json::array({"--pack", launch.model.string()})));
+        for (const auto& [choice, gpu] : {std::pair{"cpu", false}, std::pair{"gpu", true}}) {
+            launch.model_options = resolve_options(registration, {{"vision", choice}});
+            expanded = expand_template(with_vision, registration, launch, Platform::posix);
+            CHECK(expanded["vision"]["exe"] == "/opt/edge0-strata/build-vision/bin/strata-vision");
+            CHECK(expanded["vision"]["mmproj"] == launch.model.string() + "/mmproj-BF16.gguf");
+            CHECK(expanded["vision"]["model"] == launch.model.string() + "/model-skeleton.gguf");
+            CHECK(expanded["vision"]["gpu"] == gpu && expanded["vision"]["gpu"].is_boolean());
+            CHECK(!expanded.contains("vision_option"));
+            // A GPU encoder gets the engine the 700 MiB VRAM reserve setup.py and server.py give it.
+            CHECK((expanded["args"] == (gpu ? Json::array({"--pack", launch.model.string(), "--vision", "--vram-reserve-mib", "700"})
+                                            : Json::array({"--pack", launch.model.string(), "--vision"}))));
+        }
+        // A reserve given with --strata-arg (or by the template) wins over the default.
+        launch.strata_args = {"--vram-reserve-mib", "900"};
+        CHECK((expand_template(with_vision, registration, launch, Platform::posix)["args"] ==
+               Json::array({"--pack", launch.model.string(), "--vision", "--vram-reserve-mib", "900"})));
+        launch.strata_args.clear();
+        CHECK(expand_template(with_vision, registration, launch, Platform::windows)["vision"]["exe"] ==
+              "/opt/edge0-strata/build-vision/bin/strata-vision.exe");
+        // A template that already passes --vision keeps one; given by hand as well, it is a template setting.
+        auto passes = with_vision;
+        passes["args"].push_back("--vision");
+        {
+            const auto args = expand_template(passes, registration, launch, Platform::posix)["args"];
+            CHECK(std::count(args.begin(), args.end(), "--vision") == 1);
+        }
+        launch.strata_args = {"--vision"};
+        CHECK(throws_config([&] { expand_template(with_vision, registration, launch, Platform::posix); },
+                            "--strata-arg --vision: set by the launch template"));
+        launch.strata_args.clear();
+        // Pictures asked of a template without the entry (an older or hand-written engine directory) are refused.
+        CHECK(throws_config([&] { expand_template(Json::parse(R"({"exe":"x","args":[]})"), registration, launch, Platform::posix); },
+                            "no image encoder entry"));
+        CHECK(throws_config([&] { expand_template(Json::parse(R"({"exe":"x","args":[],"vision_option":"on"})"), registration, launch,
+                                                  Platform::posix); }, "no image encoder entry"));
+        // vision=off leaves nothing of pictures, even from a template that carries "vision" or --vision itself, and
+        // vision_option is not expanded then: a placeholder this edge0-infer does not know there stops only pictures.
+        {
+            auto carries = with_vision;
+            carries["vision"] = Json::parse(R"({"exe":"x","gpu":true})");
+            carries["args"].push_back("--vision");
+            carries["vision_option"]["threads"] = "${VISION_THREADS}";
+            launch.model_options = resolve_options(registration, {});
+            const auto off = expand_template(carries, registration, launch, Platform::posix);
+            CHECK(!off.contains("vision") && !off.contains("vision_option"));
+            CHECK((off["args"] == Json::array({"--pack", launch.model.string()})));
+            launch.model_options = resolve_options(registration, {{"vision", "cpu"}});
+            CHECK(throws_config([&] { expand_template(carries, registration, launch, Platform::posix); }, "unknown placeholder"));
+        }
+        // Metal: no encoder entry in its templates yet, so only vision=off.
+        CHECK(resolve_options(registration, {}, "metal").at("vision") == "off");
+        for (const auto* choice : {"cpu", "gpu"})
+            CHECK(metal_rejection(*pictures, "metal", {{"vision", choice}}) ==
+                  std::string("unsupported on Metal: vision=") + choice + "; Metal only supports vision=off");
+        CHECK(metal_rejection(*pictures, "metal", {{"vision", "off"}}).empty());
+        CHECK(metal_rejection(*pictures, "metal", {{"vision", "on"}}).empty());  // an unknown value keeps the generic error
+        fs::remove(model / "mmproj-BF16.gguf");
     }
 
     // The release templates: every model/format resolves all model files and D/U choices.

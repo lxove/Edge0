@@ -264,7 +264,7 @@ def proxy(cli, root, snapshots):
             value = json.loads(request(port, 'GET', path)[2])
             item = value['data'][0] if 'data' in value else value
             assert item['id'] == ALIAS and item['context_length'] == 131072
-            assert item['capabilities'] == {'thinking': True, 'thinking_default': True}
+            assert item['capabilities'] == {'thinking': True, 'thinking_default': True, 'vision': False}
         assert request(port, 'GET', '/v1/models/other')[0] == 404
         initial = json.loads(request(port, 'GET', '/status')[2])
         snapshots.append(initial)
@@ -1332,6 +1332,117 @@ def mac_prepare(cli, root):
     print('PASS macOS prepare: once, then skipped; failure and exit 0 leave no file or service; ple-io=ram and cuda rejected; fp4 and du=q8 start; Ctrl-C kills the script')
 
 
+# The vision_option entry of the release templates: the encoder, the model's vision projector and the GGUF for its vocabulary.
+VISION = {'exe': '${STRATA_DIR}/build-vision/bin/strata-vision${EXE_SUFFIX}', 'mmproj': '${MODEL_DIR}/mmproj-BF16.gguf',
+          'model': '${MODEL_DIR}/model-skeleton.gguf'}
+
+
+def pictures(cli, root):
+    """--model-option vision=off|cpu|gpu: off (the default) leaves the engine text only; cpu and gpu turn the template's
+    vision_option entry into the config's "vision" with its "gpu", add --vision, and report vision in /v1/models; a missing projector or encoder stops
+    before any process starts."""
+    from strata_support import TEMPLATE, write_templates
+    engine = make_engine(root / 'pic-engine')
+    write_templates(engine, {**TEMPLATE, 'vision_option': VISION})
+    model = make_model(root / 'pic-model')
+    encoder = engine / 'build-vision' / 'bin' / ('strata-vision.exe' if os.name == 'nt' else 'strata-vision')
+
+    def refused(name, extra, message):
+        record = root / f'pic-bad-{name}'
+        result = subprocess.run([str(cli), 'serve', '--model', str(model), '--port', '0', *strata_args(engine), *extra],
+                                capture_output=True, text=True, env=environment(record), timeout=60)
+        assert result.returncode == 2 and message in result.stderr, (name, result.returncode, result.stderr)
+        assert not record.exists(), ('a process was started', name)
+        return result.stderr
+
+    def running(name, extra, probe=None):
+        record = root / f'pic-run-{name}'
+        server = Running(cli, model, engine, record, extra)
+        try:
+            config = json.loads((record / 'config.json').read_text())
+            item = json.loads(request(server.port, 'GET', '/v1/models')[2])['data'][0]
+            if probe:
+                probe(server.port, record)
+            started = ''.join(server.lines)
+        finally:
+            assert server.stop() == 0
+        assert_no_leftovers(record)
+        return config, item['capabilities'], started
+
+    # Default: nothing of the template's vision_option reaches the config, so server.py starts no encoder and the
+    # engine has no --vision.
+    config, capabilities, started = running('default', [])
+    assert 'vision' not in config and 'vision_option' not in config and '--vision' not in config['args'], config
+    assert capabilities['vision'] is False and 'pictures on' not in started
+    config, capabilities, _ = running('off', ['--model-option', 'vision=off'])
+    assert 'vision' not in config and 'vision_option' not in config and capabilities['vision'] is False
+
+    # Metal lists only off, so its "must be" names only that.
+    refused('value', ['--model-option', 'vision=on'], 'must be off (got on)' if sys.platform == 'darwin' else 'must be off|cpu|gpu')
+    if sys.platform == 'darwin':
+        refused('metal', ['--model-option', 'vision=cpu'], 'only supports vision=off')
+        print('PASS pictures: Metal accepts only vision=off')
+        return
+    # The projector is required only with pictures, and the hint names the choice that needs nothing more.
+    (model / 'mmproj-BF16.gguf').unlink()
+    text = refused('projector', ['--model-option', 'vision=cpu'], 'missing: mmproj-BF16.gguf')
+    (model / 'mmproj-BF16.gguf').write_bytes(b'projector')
+    # The encoder is an optional build: say which file is missing before the engine loads the model.
+    text = refused('encoder', ['--model-option', 'vision=gpu'], 'the image encoder for --model-option vision=gpu is not built')
+    assert str(encoder) in text or encoder.name in text, text
+    encoder.parent.mkdir(parents=True)
+    encoder.write_bytes(b'')
+    def local_files(port, record):
+        """A web page (it sends Origin) may not name a file on this computer as an image; data: URLs and clients that
+        are no browser (no Origin) reach the engine."""
+        def ask(source, headers):
+            body = {'model': 'edge0-145b', 'messages': [{'role': 'user', 'content': [
+                {'type': 'text', 'text': 'what is this?'}, {'type': 'image_url', 'image_url': {'url': source}}]}]}
+            return request(port, 'POST', '/v1/chat/completions', body, headers)
+        before = len(requests_seen(record))
+        status, _, payload = ask('/home/me/id.jpg', {'Origin': 'http://evil.example:8000'})
+        assert status == 400 and b'data: URL' in payload, (status, payload)
+        anthropic = {'model': 'edge0-145b', 'max_tokens': 8, 'messages': [{'role': 'user', 'content': [
+            {'type': 'tool_result', 'tool_use_id': 't', 'content': [{'type': 'image', 'source': {'type': 'url', 'url': 'file:///etc/x.png'}}]}]}]}
+        assert request(port, 'POST', '/v1/messages', anthropic, {'Origin': 'http://evil.example:8000'})[0] == 400
+        assert len(requests_seen(record)) == before, 'a refused request reached the engine'
+        assert ask('data:image/png;base64,AAAA', {'Origin': 'http://evil.example:8000'})[0] != 400
+        assert ask('/home/me/id.jpg', {})[0] != 400
+        assert len(requests_seen(record)) == before + 2
+
+    for choice, on_gpu in (('cpu', False), ('gpu', True)):
+        config, capabilities, started = running(choice, ['--model-option', f'vision={choice}'],
+                                                local_files if choice == 'cpu' else None)
+        assert config['vision'] == {'exe': str(encoder) if os.name != 'nt' else config['vision']['exe'],
+                                    'mmproj': str(model / 'mmproj-BF16.gguf'), 'model': str(model / 'model-skeleton.gguf'),
+                                    'gpu': on_gpu}, config['vision']
+        assert Path(config['vision']['exe']) == encoder
+        assert config['args'].count('--vision') == 1, config['args']
+        tail = ['--vision', '--vram-reserve-mib', '700'] if on_gpu else ['--vision']
+        assert config['args'][-len(tail):] == tail, config['args']
+        assert capabilities == {'thinking': True, 'thinking_default': True, 'vision': True}, capabilities
+        assert f'pictures on: image encoder on the {choice.upper()}' in started, started
+    # --vision belongs to the template's setting once pictures are on.
+    refused('strata-arg', ['--model-option', 'vision=cpu', '--strata-arg', '--vision'], '--strata-arg --vision: set by the launch template')
+    # A template without the entry (an engine directory written by hand): refused, not silently text only.
+    write_templates(engine, TEMPLATE)
+    refused('no-entry', ['--model-option', 'vision=cpu'], 'no image encoder entry in its launch template')
+    # inspect checks the projector for the chosen value.
+    for choice, ok in (('off', True), ('cpu', True)):
+        inspected = subprocess.run([str(cli), 'inspect', '--model', str(model), '--json', '--model-option', f'vision={choice}'],
+                                   capture_output=True, text=True, timeout=60)
+        report = json.loads(inspected.stdout)
+        assert report['ok'] is ok and inspected.returncode == 0, inspected
+        row = next(f for f in report['files'] if f['filename'] == 'mmproj-BF16.gguf')
+        assert row['required'] == 'vision=cpu|gpu' and row['exists'] is True
+    (model / 'mmproj-BF16.gguf').unlink()
+    inspected = subprocess.run([str(cli), 'inspect', '--model', str(model), '--json', '--model-option', 'vision=cpu'],
+                               capture_output=True, text=True, timeout=60)
+    assert inspected.returncode == 1 and json.loads(inspected.stdout)['ok'] is False, inspected
+    assert 'mmproj-BF16.gguf' in inspected.stderr and '--model-option vision=off' in inspected.stderr, inspected.stderr
+    print('PASS pictures: vision=off by default, cpu/gpu reach the config and /v1/models, missing projector or encoder refused first')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--cli', required=True)
@@ -1361,6 +1472,7 @@ def main():
         parameters(args.cli, root)
         passthrough(args.cli, root)
         model_formats(args.cli, root)
+        pictures(args.cli, root)
     print('PASS serve strata')
 
 

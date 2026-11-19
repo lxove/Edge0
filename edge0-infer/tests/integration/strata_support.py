@@ -13,7 +13,8 @@ import time
 
 HERE = Path(__file__).resolve().parent
 FILES = ['latent_dense_q8.bin', 'latent_dense_q4.bin', 'model-skeleton.gguf', 'ple-fp8.gguf',
-         'profile.bin', 'experts.bin', 'labels.bin', 'dense.bin', 'index.txt', 'native_experts.txt']
+         'profile.bin', 'experts.bin', 'labels.bin', 'dense.bin', 'index.txt', 'native_experts.txt',
+         'mmproj-BF16.gguf']  # the vision projector: in every released folder, required only with vision=cpu|gpu
 # Only model_name is used from the algorithm team's service configuration.
 MODEL_JSON = '{"model_name":"edge0-145b-q3k","exe":"ignored","args":["ignored"],"env":{"ignored":"value"}}'
 ALIAS = 'edge0_145b'

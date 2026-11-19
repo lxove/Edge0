@@ -346,7 +346,15 @@ Windows または macOS（Apple Silicon）で **Edge0 Chat** を開き、**Model
 <details>
 <summary>画像 · 視覚</summary>
 
-モデルフォルダーの `mmproj-BF16.gguf` が視覚エンコーダーです。モデルの `model.json` の `args` と同じ階層に次を追加します。
+モデルフォルダーの モデルフォルダーの `mmproj-BF16.gguf` は視覚エンコーダーのプロジェクターです。エンコーダーを一度ビルドし（`edge0-strata/EDGE0.md` の Linux ビルドの手順 4）、画像を有効にしてモデルを起動します。
+
+```bash
+edge0-infer serve --model /path/to/Edge0-145B-q3k --model-option vision=cpu
+```
+
+`vision=cpu` は画像を CPU で読み、GPU をモデルに残します。`vision=gpu`（CUDA でビルドしたエンコーダー）はより速く、より細かく読みます。ログに `pictures on` と出たら、OpenAI API の `image_url`、または Anthropic API の `image` ブロックで画像を送れます。詳細は [Pictures](edge0-infer/docs/edge0-145b.md#pictures) を参照してください。
+
+`serve/server.py` を自分で起動する場合は、モデルの `model.json` の `args` と同じ階層に次を追加します。
 
 ```json
 "vision": {"exe": "/path/to/strata-vision", "mmproj": "./mmproj-BF16.gguf",

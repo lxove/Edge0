@@ -52,6 +52,39 @@ std::string timestamp() {
         << std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000 << 'Z';
     return out.str();
 }
+// True when a request body names an image by a local file path (anything but data:, http(s) and the engine's own
+// strata-tool-media: references), in any of the shapes server.py reads: OpenAI image_url / input_image parts and
+// Anthropic image parts, at any depth (tool results carry pictures too).
+bool names_local_image(const Json& value) {
+    if (value.is_array()) {
+        for (const auto& item : value) if (names_local_image(item)) return true;
+        return false;
+    }
+    if (!value.is_object()) return false;
+    const auto type = value.find("type");
+    if (type != value.end() && type->is_string()) {
+        Json source;
+        if (*type == "image") {
+            const auto found = value.find("source");
+            if (found != value.end() && found->is_object()) {
+                const auto kind = found->find("type");
+                if (kind == found->end() || *kind != "base64")
+                    source = found->contains("url") ? (*found)["url"] : found->contains("path") ? (*found)["path"] : Json();
+            }
+        } else if (*type == "image_url" || *type == "input_image") {
+            const auto found = value.find("image_url");
+            if (found != value.end()) source = found->is_object() && found->contains("url") ? (*found)["url"] : *found;
+        }
+        if (source.is_string()) {
+            const auto text = source.get<std::string>();
+            bool safe = text.empty();
+            for (const char* prefix : {"data:", "http://", "https://", "strata-tool-media:"}) safe = safe || text.rfind(prefix, 0) == 0;
+            if (!safe) return true;
+        }
+    }
+    for (const auto& item : value.items()) if (names_local_image(item.value())) return true;
+    return false;
+}
 Json error_body(const std::string& message, const std::string& code, int status=500, const std::string& path={}) {
     if(path=="/v1/messages" || path.rfind("/v1/messages/",0)==0)return portal::Failure(status,message,code).body(portal::Protocol::messages);
     return {{"error", {{"message", message}, {"type", "server_error"}, {"code", code}, {"param", nullptr}}}};
@@ -154,7 +187,9 @@ int serve(int argc, char** argv, const Match& match) {
             ~Restore() { std::signal(SIGINT, a); std::signal(SIGTERM, b); }
         } restore{old_int, old_term};
 
-        log("edge0-strata: starting " + match.registration->id + " from " + options.strata_dir.string() + " on " + options.device);
+        const auto pictures = vision_choice(options.model_options);
+        log("edge0-strata: starting " + match.registration->id + " from " + options.strata_dir.string() + " on " + options.device +
+            (pictures == "off" ? "" : " (pictures on: image encoder on the " + std::string(pictures == "gpu" ? "GPU" : "CPU") + ")"));
         auto launched = launch(*match.registration, options, {}, &interrupted);
         auto& engine = *launched->engine;
         const int upstream_port = engine.port();
@@ -332,10 +367,13 @@ int serve(int argc, char** argv, const Match& match) {
             res.set_content(upstream->body, upstream->has_header("Content-Type") ? upstream->get_header_value("Content-Type")
                                                                                : "application/octet-stream");
         });
+        // Pictures are accepted when the engine was started with an image encoder (--model-option vision=cpu|gpu).
+        const bool vision_on = pictures != "off";
         auto model_object = [&] {
             return Json{{"id", options.alias}, {"object", "model"}, {"created", 0}, {"owned_by", "local"},
                         {"context_length", context ? Json(*context) : Json(nullptr)},
-                        {"capabilities", {{"thinking", match.registration->thinking}, {"thinking_default", match.registration->thinking_default}}}};
+                        {"capabilities", {{"thinking", match.registration->thinking}, {"thinking_default", match.registration->thinking_default},
+                                          {"vision", vision_on}}}};
         };
         server.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
             res.set_content(Json{{"object", "list"}, {"data", Json::array({model_object()})}}.dump(), "application/json");
@@ -381,6 +419,21 @@ int serve(int argc, char** argv, const Match& match) {
                 const auto body = Json::parse(req.body, nullptr, false);
                 f->stream = !body.is_discarded() && body.is_object() && body.contains("stream") && body["stream"] == true;
                 f->accounting.streaming = f->stream;
+            }
+            // server.py refuses a file path as an image from a web page of another origin, but it sees neither the
+            // page's Origin nor its Host behind this proxy, so a page that reaches this port (DNS rebinding needs no
+            // API key on loopback) could have a file on this computer read and described. Browsers send Origin with
+            // every POST; clients that are no browser do not, and keep sending file paths.
+            if (vision_on && req.has_header("Origin")) {
+                const auto body = Json::parse(req.body, nullptr, false);
+                if (!body.is_discarded() && names_local_image(body)) {
+                    f->body = error_body("a web page cannot have a file on this computer read as an image: send it as a data: URL",
+                                         "invalid_request_error", 400, req.path).dump();
+                    res.status = 400;
+                    res.set_content(f->body, "application/json");
+                    finish(f, 400);
+                    return;
+                }
             }
             if (!healthy()) {
                 f->body = stopping ? error_body("Server shutting down", "shutting_down",503,req.path).dump()

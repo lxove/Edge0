@@ -70,11 +70,13 @@ def read_table(doc):
         elif required == 'for Q3_K folders':
             condition = 'experts=q3k'
         else:
-            match = re.fullmatch(r'for `([a-z-]+=[a-z0-9]+)`', required)
-            if not match:
+            # "for `du=q8`", or one option with several values: "for `vision=cpu` or `vision=gpu`" (registry "vision=cpu|gpu")
+            match = re.fullmatch(r'for (`[a-z-]+=[a-z0-9]+`(?: or `[a-z-]+=[a-z0-9]+`)*)', required)
+            pairs = re.findall(r'`([a-z-]+)=([a-z0-9]+)`', match.group(1)) if match else []
+            if not pairs or len({name for name, _ in pairs}) != 1:
                 errors.append(f'{doc.name}: unrecognised Required cell: {required}')
                 continue
-            condition = match.group(1)
+            condition = pairs[0][0] + '=' + '|'.join(value for _, value in pairs)
         for name in re.findall(r'`([^`]+)`', cells[0]):
             if name in table:
                 errors.append(f'{doc.name}: {name} is listed more than once')

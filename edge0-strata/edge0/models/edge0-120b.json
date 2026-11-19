@@ -45,5 +45,10 @@
   "gpus_asked": true,
   "lib_dirs": [
     "${CUDA_LIB_DIR}"
-  ]
+  ],
+  "vision_option": {
+    "exe": "${STRATA_DIR}/build-vision/bin/strata-vision${EXE_SUFFIX}",
+    "mmproj": "${MODEL_DIR}/mmproj-BF16.gguf",
+    "model": "${MODEL_DIR}/model-skeleton.gguf"
+  }
 }

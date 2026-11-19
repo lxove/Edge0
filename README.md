@@ -339,7 +339,18 @@ Open **Edge0 Chat** on Windows or macOS (Apple Silicon). Under **Models**, downl
 <details>
 <summary>Images · vision</summary>
 
-`mmproj-BF16.gguf` in the model folder is the vision encoder. Add this to the model's `model.json`, next to `args`:
+`mmproj-BF16.gguf` in the model folder is the projector of the vision encoder. Build the encoder once (`edge0-strata/EDGE0.md`,
+step 4 of the Linux build), then start the model with pictures on:
+
+```bash
+edge0-infer serve --model /path/to/Edge0-145B-q3k --model-option vision=cpu
+```
+
+`vision=cpu` reads pictures on the CPU and leaves the GPU to the model; `vision=gpu` (an encoder built with CUDA) reads them
+faster and in more detail. The log then says `pictures on`; send a picture as an `image_url` part over the OpenAI API or an
+`image` block over the Anthropic API. Details: [Pictures](edge0-infer/docs/edge0-145b.md#pictures).
+
+To start `serve/server.py` yourself, add this to the model's `model.json`, next to `args`:
 
 ```json
 "vision": {"exe": "/path/to/strata-vision", "mmproj": "./mmproj-BF16.gguf",

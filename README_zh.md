@@ -346,7 +346,15 @@ cd /path/to/Edge0-145B-q3k
 <details>
 <summary>图片 · 视觉</summary>
 
-模型文件夹里的 `mmproj-BF16.gguf` 是视觉编码器。在模型的 `model.json` 里、`args` 同级加：
+模型文件夹里的 模型文件夹里的 `mmproj-BF16.gguf` 是视觉编码器的投影层。先编译一次编码器（`edge0-strata/EDGE0.md`，Linux 编译第 4 步），再以开启图像的方式启动模型：
+
+```bash
+edge0-infer serve --model /path/to/Edge0-145B-q3k --model-option vision=cpu
+```
+
+`vision=cpu` 在 CPU 上读图，把 GPU 留给模型；`vision=gpu`（用 CUDA 编译的编码器）读得更快、更细。日志出现 `pictures on` 后即可发图：OpenAI 接口用 `image_url`，Anthropic 接口用 `image` 块。详见 [Pictures](edge0-infer/docs/edge0-145b.md#pictures)。
+
+若自己启动 `serve/server.py`，在模型的 `model.json` 里、`args` 同级加下面这段：
 
 ```json
 "vision": {"exe": "/path/to/strata-vision", "mmproj": "./mmproj-BF16.gguf",

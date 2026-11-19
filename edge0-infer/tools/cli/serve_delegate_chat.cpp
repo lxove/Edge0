@@ -74,7 +74,17 @@ int chat(int argc, char** argv, const Match& match) {
     try {
         const auto args = parse(argc, argv);
         const char* cuda_path = std::getenv("CUDA_PATH");
+        // chat has no command that sends a picture: an image encoder would only take memory from the model. Checked
+        // before resolve(), which would otherwise ask for the vision projector chat never uses. On macOS resolve()
+        // says first that Metal takes only vision=off, and an unknown value keeps resolve()'s "must be" error.
+        if (const auto vision = vision_choice(args.common.model_options);
+            host_platform() != Platform::macos && (vision == "cpu" || vision == "gpu"))
+            throw ConfigError("invalid_argument: --model-option vision=" + vision +
+                              ": chat has no command for pictures; use serve, or leave vision=off");
         const auto options = resolve(args.common, match, executable_path(argv[0]), host_platform(), cuda_path ? cuda_path : "");
+        if (vision_choice(options.model_options) != "off")
+            throw ConfigError("invalid_argument: --model-option vision=" + vision_choice(options.model_options) +
+                              ": chat has no command for pictures; use serve, or leave vision=off");
         for (const auto& warning : options.warnings) std::cerr << "warning: " << warning << '\n';
         interrupted = false;
         auto previous = std::signal(SIGINT, on_sigint);

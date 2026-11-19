@@ -25,14 +25,15 @@ const std::vector<Registration>& registry() {
           {"ple-fp8.gguf", false, ""},  // per-layer embedding table (FP8)
           {"profile.bin", false, ""},  // expert ranking that decides which experts are cached up front
           {"mtp", true, ""},  // original MTP draft layer (speculative decoding)
-          {"tokenizer", true, ""}},  // tokenizer
-         {{"du", {"q8", "q4"}}, {"ple-io", {"direct", "ram"}}},
+          {"tokenizer", true, ""},  // tokenizer
+          {"mmproj-BF16.gguf", false, "vision=cpu|gpu"}},  // vision projector: what the image encoder reads pictures with
+         {{"du", {"q8", "q4"}}, {"ple-io", {"direct", "ram"}}, {"vision", {"off", "cpu", "gpu"}}},
          true,
          true,
          {{"edge0-145b-q3k", "q3k"}, {"edge0-145b-fp4", "fp4"}},
-         // Metal: a q3k folder defaults to q4, an fp4 folder to the model's own default.
-         {{"metal", {{"du", {"q4", "q8"}}, {"ple-io", {"direct"}}}},
-          {"metal/fp4", {{"du", {"q8", "q4"}}, {"ple-io", {"direct"}}}}}},
+         // Metal: a q3k folder defaults to q4, an fp4 folder to the model's own default. No image encoder yet.
+         {{"metal", {{"du", {"q4", "q8"}}, {"ple-io", {"direct"}}, {"vision", {"off"}}}},
+          {"metal/fp4", {{"du", {"q8", "q4"}}, {"ple-io", {"direct"}}, {"vision", {"off"}}}}}},
         {"edge0_120b", "edge0-strata", "edge0/models/edge0-120b.json",
          {{"model.json", false, ""},  // release identifier
           {"experts.bin", false, ""},  // latent experts, 48 layers x 512
@@ -47,12 +48,13 @@ const std::vector<Registration>& registry() {
           {"ple-fp8.gguf", false, ""},  // per-layer embedding table (FP8)
           {"profile.bin", false, ""},  // expert ranking that decides which experts are cached up front
           {"mtp", true, ""},  // original MTP draft layer (speculative decoding)
-          {"tokenizer", true, ""}},  // tokenizer
-         {{"du", {"q4", "q8"}}, {"ple-io", {"direct", "ram"}}},
+          {"tokenizer", true, ""},  // tokenizer
+          {"mmproj-BF16.gguf", false, "vision=cpu|gpu"}},  // vision projector: what the image encoder reads pictures with
+         {{"du", {"q4", "q8"}}, {"ple-io", {"direct", "ram"}}, {"vision", {"off", "cpu", "gpu"}}},
          true,
          true,
          {{"edge0-120b-q3k", "q3k"}, {"edge0-120b-fp4", "fp4"}},
-         {{"metal", {{"du", {"q4", "q8"}}, {"ple-io", {"direct"}}}}}},
+         {{"metal", {{"du", {"q4", "q8"}}, {"ple-io", {"direct"}}, {"vision", {"off"}}}}}},
     };
     return entries;
 }
@@ -90,11 +92,16 @@ const std::vector<std::pair<std::string, std::vector<std::string>>>& options_for
     if (found == registration.device_options.end()) found = registration.device_options.find(device);
     return found == registration.device_options.end() ? registration.options : found->second;
 }
+// A file's condition: empty (always), "<option>=<value>", or "<option>=<value>|<value>|..." (any one of the values).
 bool condition_holds(const std::string& condition, const std::map<std::string, std::string>& options) {
     if (condition.empty()) return true;
     const auto equals = condition.find('=');
     const auto found = options.find(condition.substr(0, equals));
-    return found != options.end() && found->second == condition.substr(equals + 1);
+    if (found == options.end()) return false;
+    std::istringstream values(condition.substr(equals + 1));
+    for (std::string value; std::getline(values, value, '|');)
+        if (value == found->second) return true;
+    return false;
 }
 std::string trim(std::string text) {
     const auto first = text.find_first_not_of(" \t\r\n");
@@ -132,9 +139,10 @@ std::vector<std::string> Match::alternatives(const std::map<std::string, std::st
     for (const auto& option : options_for(*registration, device, experts)) {
         if (std::find(involved.begin(), involved.end(), option.first) == involved.end()) continue;
         const auto value = std::find_if(option.second.begin(), option.second.end(), [&](const std::string& value) {
-            const auto condition = option.first + "=" + value;
+            const std::map<std::string, std::string> candidate = {{option.first, value}};
             return value != options.at(option.first) && std::all_of(files.begin(), files.end(), [&](const auto& state) {
-                       return state.file->condition != condition || state.exists;
+                       return state.exists || state.file->condition.rfind(option.first + "=", 0) != 0 ||
+                              !condition_holds(state.file->condition, candidate);
                    });
         });
         if (value == option.second.end()) return {};
@@ -236,6 +244,10 @@ std::string metal_rejection(const Match&, const std::string& device, const std::
     const auto ple = given.find("ple-io");
     if (ple != given.end() && ple->second == "ram")
         return "unsupported on Metal: ple-io=ram; Metal only supports ple-io=direct";
+    // The Metal templates have no image encoder entry yet.
+    const auto vision = given.find("vision");
+    if (vision != given.end() && (vision->second == "cpu" || vision->second == "gpu"))
+        return "unsupported on Metal: vision=" + vision->second + "; Metal only supports vision=off";
     return {};
 }
 
@@ -257,6 +269,11 @@ ParsedDevice parse_device(const std::string& value, Platform platform) {
 
 std::string default_device(Platform platform) {
     return platform == Platform::macos ? "metal" : "cuda:0";
+}
+
+std::string vision_choice(const std::map<std::string, std::string>& model_options) {
+    const auto found = model_options.find("vision");
+    return found == model_options.end() ? "off" : found->second;
 }
 
 std::map<std::string, std::string> resolve_options(const Registration& registration, const std::map<std::string, std::string>& given,
@@ -409,6 +426,11 @@ Json expand_template(const Json& config_template, const Registration& registrati
         }
         prepared["lib_dirs"] = directories;
     }
+    // vision_option is expanded only when pictures are asked for, so a placeholder this edge0-infer does not know
+    // inside it cannot stop a text-only start.
+    const auto pictures = vision_choice(options.model_options);
+    const Json encoder_template = prepared.contains("vision_option") ? prepared["vision_option"] : Json();
+    prepared.erase("vision_option");
     Json config = expand(prepared);
     config["model_name"] = options.alias.empty() ? registration.id : options.alias;
     config["gpu"] = options.gpu;
@@ -419,6 +441,27 @@ Json expand_template(const Json& config_template, const Registration& registrati
             if (args[i] == "--max-context") { args[i + 1] = std::to_string(*options.context); replaced = true; }
         if (!replaced) { args.push_back("--max-context"); args.push_back(std::to_string(*options.context)); }
     }
+    // Pictures (--model-option vision=cpu|gpu): the template's "vision_option" object names the image encoder, the
+    // model's vision projector and the GGUF the encoder reads the vocabulary from. It is never passed on under that
+    // name. Only when pictures are asked for does it become the config's "vision" section, with "gpu" chosen here
+    // and --vision on the engine's command line; otherwise the engine runs text only, exactly as before, and no
+    // encoder process is started. The template does not carry "vision" itself, because server.py starts an encoder
+    // for any "vision" section: an edge0-infer that does not know the option passes "vision_option" through, and
+    // server.py ignores it, so the same engine directory still runs text only there.
+    if (pictures == "off") {
+        // Text only: a template that carries "vision" or --vision itself must not make server.py start an encoder.
+        config.erase("vision");
+        auto& engine_args = config["args"];
+        engine_args.erase(std::remove(engine_args.begin(), engine_args.end(), "--vision"), engine_args.end());
+    } else {
+        if (!encoder_template.is_object())
+            throw ConfigError("invalid_argument: model option vision=" + pictures +
+                              ": this edge0-strata has no image encoder entry in its launch template");
+        config["vision"] = expand(encoder_template);
+        config["vision"]["gpu"] = pictures == "gpu";
+        auto& engine_args = config["args"];
+        if (std::find(engine_args.begin(), engine_args.end(), "--vision") == engine_args.end()) engine_args.push_back("--vision");
+    }
     // Machine tuning for the engine, given word by word. Only options ("--...") are compared, so a value that
     // equals one of the template's values is passed on; the template's model settings cannot be overridden.
     auto& args = config["args"];
@@ -428,6 +471,15 @@ Json expand_template(const Json& config_template, const Registration& registrati
         if (word.rfind("--", 0) == 0 && std::find(template_args.begin(), template_args.end(), word) != template_args.end())
             throw ConfigError("invalid_argument: --strata-arg " + word + ": set by the launch template");
         args.push_back(word);
+    }
+    // A GPU image encoder needs VRAM beside the engine's. setup.py and server.py give the engine the same 700 MiB
+    // reserve with --vision; without it the engine shrinks its reserve on a small card. A reserve the template or
+    // --strata-arg already sets wins.
+    if (pictures == "gpu") {
+        const bool reserved = std::any_of(args.begin(), args.end(), [](const Json& word) {
+            return word.is_string() && word.get<std::string>().rfind("--vram-reserve-mib", 0) == 0;
+        });
+        if (!reserved) { args.push_back("--vram-reserve-mib"); args.push_back("700"); }
     }
     // `prepare` is carried out by edge0-infer before the server starts. It is not part of the server's config.
     std::vector<PrepareStep> steps;
