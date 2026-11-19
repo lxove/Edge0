@@ -200,6 +200,11 @@ def failures(cli, root, engine, model):
         assert result.returncode == 2 and 'CUDA GPU' in result.stderr and not record.exists()
     result, _ = chat(cli, model, engine, record, 'hi\n', ['--temperature', '0'])
     assert result.returncode == 2 and '--temperature' in result.stderr and not record.exists()
+    # chat sends no pictures, so it starts no image encoder (on macOS the Metal rule refuses it first).
+    for choice in ('cpu', 'gpu'):
+        result, _ = chat(cli, model, engine, record, 'hi\n', ['--model-option', f'vision={choice}'])
+        expected = 'only supports vision=off' if sys.platform == 'darwin' else 'chat has no command for pictures'
+        assert result.returncode == 2 and expected in result.stderr and not record.exists(), result.stderr
     print('PASS failures: start failure and engine exit exit 1 with the log tail and a kept log, rejected options start nothing')
 
 

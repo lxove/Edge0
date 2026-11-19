@@ -344,7 +344,15 @@ Ouvrez **Edge0 Chat** sous Windows ou macOS (Apple Silicon). Dans **Models**, t�
 <details>
 <summary>Images · vision</summary>
 
-`mmproj-BF16.gguf`, dans le dossier du modèle, est l’encodeur de vision. Ajoutez ceci au `model.json` du modèle, à côté de `args` :
+`mmproj-BF16.gguf`, dans le dossier du modèle, est le projecteur de l’encodeur de vision. Compilez l’encodeur une fois (`edge0-strata/EDGE0.md`, étape 4 de la compilation sous Linux ou Windows), puis lancez le modèle avec les images :
+
+```bash
+edge0-infer serve --model /path/to/Edge0-145B-q3k --model-option vision=cpu
+```
+
+`vision=cpu` lit les images sur le CPU et laisse le GPU au modèle ; `vision=gpu` (un encodeur compilé avec CUDA) les lit plus vite et avec plus de détail. Le journal affiche alors `pictures on` ; envoyez une image avec une partie `image_url` via l’API OpenAI ou un bloc `image` via l’API Anthropic. Détails : [Pictures](edge0-infer/docs/edge0-145b.md#pictures).
+
+Pour lancer `serve/server.py` vous-même, ajoutez ceci au `model.json` du modèle, à côté de `args` :
 
 ```json
 "vision": {"exe": "/path/to/strata-vision", "mmproj": "./mmproj-BF16.gguf",

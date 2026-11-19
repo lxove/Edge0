@@ -51,6 +51,8 @@ The app keeps its settings (`settings.json`) and conversations under `%APPDATA%\
 - **Edge0 35B** uses the converted asset directory of the native engine (the folder with the `model.json` asset manifest). See [Getting started: Edge0 35B](https://github.com/Edge0-AI/Edge0/blob/{{COMMIT}}/edge0-infer/docs/getting-started.md#edge0-35b-native-engine).
 - **Edge0 145B** and **Edge0 120B** use a released model folder as provided: one model and one expert format per folder, files laid out flat, for example `Edge0-145B-q3k` (the folder that contains `model.json`, not the folder that holds several models). See [Edge0 145B: Model directory](https://github.com/Edge0-AI/Edge0/blob/{{COMMIT}}/edge0-infer/docs/edge0-145b.md#model-directory) and [Edge0 120B: Model directory](https://github.com/Edge0-AI/Edge0/blob/{{COMMIT}}/edge0-infer/docs/edge0-120b.md#model-directory).
 
+Pictures (`--model-option vision=cpu` or `vision=gpu` for Edge0 145B and Edge0 120B) need edge0-strata's image encoder, which this package does not include. It is an optional build from the sources: see step 4 of the Windows build in [edge0-strata/EDGE0.md](https://github.com/Edge0-AI/Edge0/blob/{{COMMIT}}/edge0-strata/EDGE0.md).
+
 ## Troubleshooting
 
 - **The app window flashes and closes, or WebView2 reports an error at start-up, after extracting into `Downloads`.** Some Windows setups give the `Downloads` folder a low integrity label, and files moved out of it keep the label; WebView2 cannot start at low integrity. Copy (do not move) the zip to a folder such as `C:\Edge0\` and extract it there.

@@ -52,6 +52,42 @@ std::string timestamp() {
         << std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000 << 'Z';
     return out.str();
 }
+// For a request from a web page (it carries Origin) with pictures on: true unless every image in the body is carried
+// inline. server.py reads a file path, and fetches an http(s) URL, for whoever asks; behind this proxy it sees neither
+// the page's Origin nor its Host, so a page may send only data: URLs (and the engine's own strata-tool-media:
+// references). Covers every shape server.py reads: OpenAI image_url / input_image parts and Anthropic image parts, at
+// any depth (tool results carry pictures too). server.py takes "url" or else "path" of an Anthropic source, so every
+// candidate is checked. A body nested deeper than any real request is refused rather than walked.
+bool names_outside_image(const Json& value, int depth = 0) {
+    if (!value.is_structured()) return false;
+    if (depth > 64) return true;
+    if (value.is_array()) {
+        for (const auto& item : value) if (names_outside_image(item, depth + 1)) return true;
+        return false;
+    }
+    const auto inline_source = [](const Json& source) {
+        if (!source.is_string()) return true;  // server.py reads only strings
+        const auto text = source.get<std::string>();
+        return text.empty() || text.rfind("data:", 0) == 0 || text.rfind("strata-tool-media:", 0) == 0;
+    };
+    const auto type = value.find("type");
+    if (type != value.end() && type->is_string()) {
+        if (*type == "image") {
+            const auto found = value.find("source");
+            if (found != value.end() && found->is_object()) {
+                const auto kind = found->find("type");
+                if (kind == found->end() || *kind != "base64")
+                    for (const char* key : {"url", "path"})
+                        if (found->contains(key) && !inline_source((*found)[key])) return true;
+            }
+        } else if (*type == "image_url" || *type == "input_image") {
+            const auto found = value.find("image_url");
+            if (found != value.end() && !inline_source(found->is_object() && found->contains("url") ? (*found)["url"] : *found)) return true;
+        }
+    }
+    for (const auto& item : value.items()) if (names_outside_image(item.value(), depth + 1)) return true;
+    return false;
+}
 Json error_body(const std::string& message, const std::string& code, int status=500, const std::string& path={}) {
     if(path=="/v1/messages" || path.rfind("/v1/messages/",0)==0)return portal::Failure(status,message,code).body(portal::Protocol::messages);
     return {{"error", {{"message", message}, {"type", "server_error"}, {"code", code}, {"param", nullptr}}}};
@@ -96,7 +132,7 @@ struct ServeArgs {
     CommonArgs common;
     std::string host = "127.0.0.1", key_file;
     int port = 8000, write_timeout = 30;
-    std::size_t max_body = 16 * 1024 * 1024;
+    std::optional<std::size_t> max_body;  // unset: 16 MiB, or 256 MiB (server.py's own limit) with pictures on
 };
 ServeArgs parse(int argc, char** argv) {
     ServeArgs args;
@@ -154,7 +190,9 @@ int serve(int argc, char** argv, const Match& match) {
             ~Restore() { std::signal(SIGINT, a); std::signal(SIGTERM, b); }
         } restore{old_int, old_term};
 
-        log("edge0-strata: starting " + match.registration->id + " from " + options.strata_dir.string() + " on " + options.device);
+        const auto pictures = vision_choice(options.model_options);
+        log("edge0-strata: starting " + match.registration->id + " from " + options.strata_dir.string() + " on " + options.device +
+            (pictures == "off" ? "" : " (pictures on: image encoder on the " + std::string(pictures == "gpu" ? "GPU" : "CPU") + ")"));
         auto launched = launch(*match.registration, options, {}, &interrupted);
         auto& engine = *launched->engine;
         const int upstream_port = engine.port();
@@ -240,7 +278,9 @@ int serve(int argc, char** argv, const Match& match) {
             if (!httplib::set_socket_opt(socket, SOL_SOCKET, option, 1)) throw std::runtime_error("Cannot configure exclusive server binding");
         });
         server.new_task_queue = [] { return new httplib::ThreadPool(16); };
-        server.set_payload_max_length(args.max_body);
+        // Pictures arrive as base64 and clients resend every one each turn, so 16 MiB is a few photos.
+        server.set_payload_max_length(args.max_body ? *args.max_body
+                                      : pictures == "off" ? std::size_t{16} * 1024 * 1024 : std::size_t{256} * 1024 * 1024);
         server.set_write_timeout(args.write_timeout);
         auto send_error = [](httplib::Response& res, int status, const std::string& message, const std::string& code, const std::string& path=std::string{}) {
             res.status = status;
@@ -332,10 +372,13 @@ int serve(int argc, char** argv, const Match& match) {
             res.set_content(upstream->body, upstream->has_header("Content-Type") ? upstream->get_header_value("Content-Type")
                                                                                : "application/octet-stream");
         });
+        // Pictures are accepted when the engine was started with an image encoder (--model-option vision=cpu|gpu).
+        const bool vision_on = pictures != "off";
         auto model_object = [&] {
             return Json{{"id", options.alias}, {"object", "model"}, {"created", 0}, {"owned_by", "local"},
                         {"context_length", context ? Json(*context) : Json(nullptr)},
-                        {"capabilities", {{"thinking", match.registration->thinking}, {"thinking_default", match.registration->thinking_default}}}};
+                        {"capabilities", {{"thinking", match.registration->thinking}, {"thinking_default", match.registration->thinking_default},
+                                          {"vision", vision_on}}}};
         };
         server.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
             res.set_content(Json{{"object", "list"}, {"data", Json::array({model_object()})}}.dump(), "application/json");
@@ -381,6 +424,24 @@ int serve(int argc, char** argv, const Match& match) {
                 const auto body = Json::parse(req.body, nullptr, false);
                 f->stream = !body.is_discarded() && body.is_object() && body.contains("stream") && body["stream"] == true;
                 f->accounting.streaming = f->stream;
+            }
+            // server.py refuses a file path as an image from a web page of another origin, but it sees neither the
+            // page's Origin nor its Host behind this proxy, so a page that reaches this port (DNS rebinding needs no
+            // API key on loopback) could have a file on this computer read and described, or a URL fetched from it.
+            // Browsers send Origin with every POST; clients that are no browser do not, and keep sending paths and
+            // URLs. A body this parser cannot read is refused too: server.py's parser is more lenient (NaN, ...).
+            if (vision_on && req.has_header("Origin")) {
+                const auto body = Json::parse(req.body, nullptr, false);
+                if (body.is_discarded() || names_outside_image(body)) {
+                    const portal::Failure refusal(400, body.is_discarded()
+                        ? "the request body is not valid JSON"
+                        : "a web page can send a picture only as a data: URL, not as a file path or a link", "invalid_parameter");
+                    f->body = refusal.body(req.path == "/v1/messages" ? portal::Protocol::messages : portal::Protocol::chat).dump();
+                    res.status = 400;
+                    res.set_content(f->body, "application/json");
+                    finish(f, 400);
+                    return;
+                }
             }
             if (!healthy()) {
                 f->body = stopping ? error_body("Server shutting down", "shutting_down",503,req.path).dump()

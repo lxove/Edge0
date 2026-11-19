@@ -27,7 +27,7 @@ constexpr int supported_contract = 5;
 struct RegisteredFile {
     std::string path;       // relative to the model directory
     bool directory = false;
-    std::string condition;  // empty: always required; otherwise "<option>=<value>"
+    std::string condition;  // empty: always required; otherwise "<option>=<value>" or "<option>=<value>|<value>" (any of them)
 };
 struct Registration {
     std::string id;                          // registration identifier and default alias
@@ -123,6 +123,8 @@ struct ParsedDevice {
 // macOS accepts only "metal". Every other platform accepts "cuda" and "cuda:<n>".
 ParsedDevice parse_device(const std::string& value, Platform platform = Platform::posix);
 std::string default_device(Platform platform);  // macos: metal; otherwise cuda:0
+// The --model-option vision choice ("off", "cpu" or "gpu"); "off" for options without it.
+std::string vision_choice(const std::map<std::string, std::string>& model_options);
 // Validates names and values against the registration (or that device's list, which may depend on the expert
 // format) and fills defaults.
 std::map<std::string, std::string> resolve_options(const Registration&, const std::map<std::string, std::string>& given,

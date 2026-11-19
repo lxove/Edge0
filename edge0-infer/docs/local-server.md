@@ -86,6 +86,14 @@ until it is ready, and only then prints the `Listening:` line. It acts as a prox
   line, appended in order after the launch template's arguments; an option the template
   already sets, `--max-context` (use `--context`) and an empty value are rejected before
   anything starts. See Options for [Edge0 145B](edge0-145b.md#options) and [Edge0 120B](edge0-120b.md#options) for its uses and an example.
+- `--model-option vision=cpu` or `vision=gpu` starts edge0-strata's image encoder beside the engine and adds the
+  engine's `--vision`, so requests may carry pictures (OpenAI `image_url` parts and Anthropic `image` blocks, forwarded
+  as they are); `/v1/models` then reports `capabilities.vision` as `true`. The default, `vision=off`, runs text only and
+  starts no encoder. `vision=gpu` also gives the engine `--vram-reserve-mib 700` for the encoder's GPU memory, unless
+  `--strata-arg` sets another reserve. A missing encoder build or vision projector file stops `serve` before anything
+  starts. With pictures on, the default of `--max-body-bytes` is 268435456, and a request with an `Origin` header (a
+  web page) may carry pictures only as `data:` URLs. See Pictures for [Edge0 145B](edge0-145b.md#pictures) and
+  [Edge0 120B](edge0-120b.md#pictures).
 - If edge0-strata cannot be found, has an unsupported launch contract version, fails to
   start, exits before it is ready or is not ready in time, `serve` exits with an error
   before listening. If it exits later, generation requests and `/health` return 503.
@@ -255,7 +263,7 @@ skipped tests. See [examples](../examples/README.md) for native and HTTP clients
 
 ## Engine extensions
 
-Both model endpoints (`GET /v1/models` and `GET /v1/models/{id}`) include `context_length` (the loaded context capacity) and a `capabilities` object in each model entry. `thinking` is whether the loaded model supports enabling thinking; `thinking_default` is its default. Applications can use these booleans to enable and initialize a thinking switch.
+Both model endpoints (`GET /v1/models` and `GET /v1/models/{id}`) include `context_length` (the loaded context capacity) and a `capabilities` object in each model entry. `thinking` is whether the loaded model supports enabling thinking; `thinking_default` is its default. Applications can use these booleans to enable and initialize a thinking switch. `vision` is whether the server accepts pictures: `true` only for an Edge0 145B or 120B started with `--model-option vision=cpu` or `vision=gpu`, and `false` otherwise, including every model served natively. Applications can use it to show or hide a picture button.
 
 Completed generation output includes a top-level `metrics` object alongside `usage`: in full Chat Completions, the final Chat streaming usage chunk when `stream_options.include_usage` is true, and the final Responses response object (including streaming completion or token-limit termination).
 

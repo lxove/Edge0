@@ -250,7 +250,7 @@ int serve_command(int argc,char** argv) {
             input.memory = take(edge0::memory_snapshot(runtime)); input.system = edge0::query_system_status();
             res.set_content(portal::status_json(input).dump(),"application/json");
         });
-        auto model_object=[&]{return Json{{"id",o.alias},{"object","model"},{"created",0},{"owned_by","local"},{"context_length",description.context},{"capabilities",{{"thinking",description.thinking_enabled_supported},{"thinking_default",description.thinking_default}}}};};
+        auto model_object=[&]{return Json{{"id",o.alias},{"object","model"},{"created",0},{"owned_by","local"},{"context_length",description.context},{"capabilities",{{"thinking",description.thinking_enabled_supported},{"thinking_default",description.thinking_default},{"vision",false}}}};};
         server.Get("/health",[&](const httplib::Request& req,httplib::Response& res){if(engine.stopping())send_error(req,res,portal::Failure(503,"Server shutting down","shutting_down"));else res.set_content("{\"status\":\"ok\"}","application/json");});
         server.Get("/v1/models",[&](const httplib::Request&,httplib::Response& res){res.set_content(Json{{"object","list"},{"data",Json::array({model_object()})}}.dump(),"application/json");});
         server.Get(R"(/v1/models/(.+))",[&](const httplib::Request& req,httplib::Response& res){if(req.matches[1].str()!=o.alias)send_error(req,res,portal::Failure(404,"Unknown model","model_not_found","model"));else res.set_content(model_object().dump(),"application/json");});

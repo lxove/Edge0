@@ -16,6 +16,7 @@ extern char** environ;
 #endif
 #include <httplib.h>
 #include <algorithm>
+#include <cctype>
 #include <csignal>
 #include <cerrno>
 #include <limits>
@@ -666,6 +667,41 @@ std::unique_ptr<Launch> launch(const Registration& registration, const LaunchOpt
     std::vector<PrepareStep> steps;
     result->config = expand_template(load_template(options.strata_dir, registration, options.device), registration, options,
                                      options.platform, &steps);
+    // vision=cpu|gpu: the encoder is an optional build of edge0-strata (EDGE0.md). Say so here, before anything starts,
+    // rather than letting server.py fail on a missing program after the model has loaded.
+    if (result->config.contains("vision")) {
+        const auto& section = result->config["vision"];
+        if (!section.is_object())
+            throw ConfigError("edge0-strata configuration template is invalid: its image encoder entry (vision_option) must be an object");
+        const auto choice = vision_choice(options.model_options);
+        const Json exe = section.contains("exe") ? section["exe"] : Json();
+        if (!exe.is_string() || !fs::is_regular_file(exe.get<std::string>(), error))
+            throw ConfigError("the image encoder for --model-option vision=" + choice + " is not built: " +
+                              (exe.is_string() ? exe.get<std::string>() : std::string("(no exe in the template)")) +
+                              " is missing (build strata-vision from the edge0-strata sources as their EDGE0.md describes; the release"
+                              " packages do not include it; or leave vision=off)");
+        // A plain build of the encoder has no GPU backend and quietly reads pictures on the CPU even when told --gpu.
+        // A build tree says which it is; an installed encoder without one is taken on trust.
+        if (choice == "gpu") {
+            std::ifstream cache(fs::path(exe.get<std::string>()).parent_path().parent_path() / "CMakeCache.txt");
+            if (cache) {
+                bool gpu = false;
+                for (std::string line; std::getline(cache, line);) {
+                    if (!line.empty() && line.back() == '\r') line.pop_back();
+                    const auto equals = line.find('=');
+                    if (equals == std::string::npos) continue;
+                    std::string value = line.substr(equals + 1);
+                    for (auto& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    // Only the CUDA build writes this program; the HIP and SYCL builds write their own.
+                    if (line.rfind("STRATA_VISION_CUDA:", 0) == 0 && (value == "ON" || value == "TRUE" || value == "1" || value == "YES")) gpu = true;
+                }
+                if (!gpu)
+                    std::cerr << "warning: --model-option vision=gpu: " << exe.get<std::string>()
+                              << " was built without CUDA, so pictures are read on the CPU; rebuild it with"
+                                 " -DSTRATA_VISION_CUDA=ON as edge0-strata/EDGE0.md describes\n";
+            }
+        }
+    }
     run_prepare(steps, options, interrupted);
     const auto config = result->temp.path / "config.json";
     write_file(config, result->config.dump(2) + "\n");

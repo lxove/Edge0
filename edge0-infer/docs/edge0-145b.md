@@ -10,6 +10,7 @@ This page is the reference for running Edge0 145B with `edge0-infer`; [Getting s
 - On Linux and Windows, at least 16 GiB of GPU memory and 20 GiB of system memory.
 - `edge0-infer` built as in [Build](getting-started.md#build) (the `cpu` preset on Linux, or the `cpu` or `mac-metal` preset on macOS) or [Windows](getting-started.md#windows); it needs no GPU backend of its own for these models.
 - edge0-strata built as described in `edge0-strata/EDGE0.md` in the Edge0 repository. `edge0-infer` uses `edge0-strata/build/strata` on Linux, `edge0-strata/build/strata.exe` on Windows, or `edge0-strata/build-metal/strata` on macOS, and the Python environment `edge0-strata/.venv` that the build produces.
+- For pictures only: edge0-strata's image encoder, `edge0-strata/build-vision/bin/strata-vision`, an optional build described in the same file (see [Pictures](#pictures)).
 
 ## Model directory
 
@@ -44,6 +45,7 @@ On Windows, set it with `$env:EDGE0_145B = "C:\path\to\Edge0-145B-q3k"` in Power
 | `profile.bin` | Expert ranking used to choose which experts to keep on the GPU | yes |
 | `mtp/` | Draft layer for speculative decoding | yes |
 | `tokenizer/` | Tokenizer | yes |
+| `mmproj-BF16.gguf` | Vision projector, read by the image encoder | for `vision=cpu` or `vision=gpu` |
 
 `edge0-infer`'s asset tools do not produce this directory. Check it with:
 
@@ -57,7 +59,7 @@ D/U defaults to `q8`; add `--model-option du=q4` to check the other choice. On m
 Only Q3_K folders list or require `scales/` (in the report its `required` value is `experts=q3k`).
 
 When files are missing, standard output remains valid JSON and standard error lists the missing files.
-A hint suggests another D/U choice only when its files complete the directory.
+A hint names another choice only when its files complete the directory: the other D/U choice, or `--model-option vision=off` when the vision projector is missing.
 Starting `serve` or `chat` uses the same defaults and reports missing files without falling back.
 
 ## Serve
@@ -94,6 +96,7 @@ The commands are those of the native chat (`/file`, `"""`, `/think on|off`, `/ne
 | `--device` | `metal` on macOS; `cuda` or `cuda:<n>` on Linux and Windows | `metal` on macOS, `cuda:0` otherwise |
 | `--model-option du=` | `q8` or `q4` | `q8` (`q4` for a Q3_K folder on macOS) |
 | `--model-option ple-io=` | `direct` (read the embedding table from disk as needed) or `ram` (load it into memory; to keep it locked there, raise the locked-memory limit, e.g. `ulimit -l unlimited`) | `direct` |
+| `--model-option vision=` | `off` (text only), `cpu` (pictures, read by an image encoder on the CPU) or `gpu` (on the GPU); see [Pictures](#pictures) | `off` (only `off` on macOS) |
 | `--context` | tokens | 131072 (`32768` on macOS) |
 | `--strata-arg` | one word of edge0-strata's engine command line; repeat it for each word, e.g. `--strata-arg --pool-workers --strata-arg 24` | none |
 
@@ -111,6 +114,36 @@ The words are appended in the order given, after the template's arguments; write
 `--device` names one card, and that card becomes the config's `gpu`: the engine may use only it. A second graphics card (an expert tier for the experts the first one cannot hold) is therefore not reachable through `edge0-infer` yet — add `"gpu": [0, 1]` and the second card's flags to the engine's config and start `serve/server.py` directly, as `edge0-strata/EDGE0.md` describes under *Two GPUs*.
 
 The template requires launch contract version 5; an older engine template is rejected with both versions in the error.
+
+## Pictures
+
+Every Edge0 145B folder holds the model's vision projector, `mmproj-BF16.gguf`. With `--model-option vision=cpu` or `vision=gpu`, `edge0-infer` starts edge0-strata's image encoder (`strata-vision`) beside the engine, and requests may then carry pictures:
+
+```sh
+build/cpu/bin/edge0-infer serve --model "$EDGE0_145B" --model-option vision=cpu
+curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d '{"model": "edge0_145b",
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+    {"type": "text", "text": "What is in this picture?"}]}]}'
+```
+
+OpenAI `image_url` parts (a `data:` URL, an `http(s)` URL or a local file path) and Anthropic `image` blocks are forwarded as they are; JPEG, PNG, BMP and GIF are read directly, and other formats (WebP, TIFF, ...) are converted first. `/v1/models` reports `capabilities.vision` as `true`, and the startup line says `pictures on`. The 64 most recently used pictures stay encoded, so a client that sends the same picture again with every turn pays for it only the first time.
+
+A web page (a request with an `Origin` header) may send a picture only as a `data:` URL: a file path would be read from this computer and a link fetched from it, so both are refused with 400. Clients that are not browsers, such as curl and the SDKs, are not limited. Pictures travel as base64 and are sent again with every turn, so with pictures on the largest request body is 256 MiB instead of 16 MiB; `--max-body-bytes` still sets another limit.
+
+The encoder is an optional build from the edge0-strata sources (step 4 of the Linux and of the Windows build in `edge0-strata/EDGE0.md`); the release packages do not include it. `vision=gpu` needs it built with `-DSTRATA_VISION_CUDA=ON`; that build also serves `vision=cpu`. `serve` stops before anything starts when the encoder or `mmproj-BF16.gguf` is missing, and `inspect --model-option vision=cpu` checks the folder.
+
+`vision=off` (the default) starts no encoder and leaves the engine exactly as it runs text. Of the two others:
+
+| | `vision=cpu` | `vision=gpu` |
+| --- | --- | --- |
+| Where the encoder runs | CPU threads, beside the engine | the GPU the model uses |
+| Picture detail (tokens per picture, at most) | 300 | 1024 |
+| Memory for the encoder | about 1.0 GiB of system memory (1.3 GiB at its peak) | 1.3 GiB of GPU memory, plus 0.6 GiB of system memory |
+| Reading a new picture | about 5 s on 4 CPU cores | about 0.05 s (0.9 s at 1000 tokens) |
+| Text speed | unchanged | an 11 % smaller expert cache: decoding about the same, reading prompts 4–5 % slower |
+
+Measured with Edge0 120B Q3_K (Edge0 145B was not measured) on an RTX 3090 (24 GB) and a 4-core Intel Core i3-10105; the time to the first token of a picture question adds the prompt reading of its picture tokens. Below 24 GB of GPU memory, `vision=cpu` keeps the whole expert cache for the text, as Strata's own setup chooses; from 24 GB, `vision=gpu` costs little.
 
 ## CUDA libraries on Windows
 
@@ -131,3 +164,4 @@ the DLL. A missing runtime DLL can produce exit code `0xC0000135`.
 - Concurrent requests wait in edge0-strata's queue instead of receiving 429 as with the native server.
 - `/status` holds no memory breakdown or expert statistics for this model; those fields are null. Progress of a request in flight is counted by `edge0-infer serve` from the text fragments it forwards (one token per fragment), and only for streaming requests; the finished records use the engine's own numbers (see the `Delegated` column of the [status fields](local-server.md#status-and-lan-authentication)).
 - Identical requests at temperature 0 can produce different answers: edge0-strata's decoding is not bit-for-bit repeatable.
+- Pictures reach the model through `serve` only: `chat` has no command for them and refuses `vision=cpu` and `vision=gpu`. On macOS only `vision=off` is accepted, because the Metal templates have no image encoder entry yet.

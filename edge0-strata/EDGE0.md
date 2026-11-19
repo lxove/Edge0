@@ -122,11 +122,27 @@ Requirements: CUDA 13, CMake 3.24 or newer, Ninja, a C++17 compiler, Python 3.10
    uv pip install --python .venv/bin/python -r requirements.txt
    ```
 
+4. Optional, for pictures (`edge0-infer --model-option vision=cpu` or `vision=gpu`): build the image
+   encoder, `strata-vision`, from the same llama.cpp source:
+
+   ```
+   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release \
+     -DLLAMA_DIR="$PWD/third_party/llama.cpp"
+   cmake --build build-vision --target strata-vision
+   ```
+
+   This encoder reads pictures on the CPU (`vision=cpu`). For `vision=gpu`, configure it with
+   `-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native` as well; that build reads them on the GPU
+   and also accepts `vision=cpu`. `edge0-infer` warns when `vision=gpu` starts an encoder whose build
+   (`build-vision/CMakeCache.txt`) was configured without CUDA, because such an encoder reads pictures on the CPU
+   without saying so. Without the build, the models run as before, text only.
+
 Build only the `strata` target: the imported snapshot also contains experimental parity and
 benchmark targets whose links are incomplete. They are not needed to run the engine.
 
 The result is `build/strata` (the engine) and `.venv/bin/python` (the interpreter that runs
-`serve/server.py`), the two paths `edge0-infer` uses by default.
+`serve/server.py`), the two paths `edge0-infer` uses by default, and with step 4
+`build-vision/bin/strata-vision`, the encoder `edge0-infer` starts for `vision=cpu|gpu`.
 
 ## Build (Windows, NVIDIA)
 
@@ -186,6 +202,20 @@ on `PATH`, and change to `edge0-strata/`. The CUDA installer sets `CUDA_PATH`, f
 
    If the package index cannot be reached, `python -m venv --system-site-packages .venv` also works when
    the existing Python installation has the pinned versions of the packages.
+
+4. Optional, for pictures (`--model-option vision=cpu|gpu`): build the image encoder in the same prompt.
+   Ninja puts it at `build-vision\bin\strata-vision.exe`, where `edge0-infer` looks for it.
+
+   ```bat
+   cmake -S tools\vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+     -DLLAMA_DIR="%CD%\third_party\llama.cpp"
+   cmake --build build-vision --target strata-vision
+   ```
+
+   This encoder reads pictures on the CPU (`vision=cpu`). For `vision=gpu`, add
+   `-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_COMPILER="%CUDA_PATH%\bin\nvcc.exe" -DCMAKE_CUDA_ARCHITECTURES=native`.
+   On an Arm64 CPU, pass the same clang-cl compiler options as in step 2. Without the build, the models
+   run as before, text only.
 
 `edge0-infer` uses `.venv\Scripts\python.exe` by default and stops with "Python for edge0-strata not
 found" when it is missing. It expands CUDA library directories from `%CUDA_PATH%\bin\x64` and
@@ -404,6 +434,24 @@ quality on this build has only been checked by hand.
   Metal accepts both expert formats and both D/U formats, with `ple-io=direct`. A Q3_K folder
   (`model_name` ending in `-q3k`) defaults to `du=q4`; an NVFP4 folder keeps the model's own
   default. `ple-io=ram` is rejected before any process starts.
+
+  The CUDA templates contain a `vision_option` object: the image encoder (`exe`,
+  `build-vision/bin/strata-vision`), the model's vision projector (`mmproj`, `mmproj-BF16.gguf`) and the
+  GGUF it reads the vocabulary from (`model`). Its strings use the placeholders above. `edge0-infer` never
+  passes it on under that name: for `--model-option vision=cpu` or `vision=gpu` it becomes the config's
+  `vision` section, with `gpu` set (`false` or `true`) and `--vision` added to `args`, and `server.py`
+  starts the encoder beside the engine. For `vision=gpu` it also adds `--vram-reserve-mib 700`, the reserve
+  `setup.py` writes for a GPU encoder, unless the template or `--strata-arg` already sets one. With
+  `vision=off`, the default, the object is removed without its placeholders being expanded, together with
+  any `vision` section or `--vision` a template carries itself, and the engine runs text only as before.
+  `edge0-infer` stops before any process starts when the encoder or the projector file is missing. With
+  pictures on, a browser request (one with an `Origin` header) may carry a picture only as a `data:` URL: one
+  that names a file or a link, or whose body the proxy cannot parse, is refused with 400, because
+  `server.py` cannot see the page's origin behind the proxy and would read the file or fetch the link.
+  The object is not named `vision` because `server.py` starts an encoder
+  for any `vision` section: an `edge0-infer` from before this option passes `vision_option` through,
+  `server.py` ignores it, and the model runs text only, so the contract version stays 5. The Metal
+  templates have no `vision_option` object; Metal accepts only `vision=off`.
 
   `edge0-infer` also sets `gpu` from `--device` (`cuda:<n>` on Linux and Windows, `metal` on macOS),
   `model_name` from `--alias`, and the `--max-context` argument from `--context`.
